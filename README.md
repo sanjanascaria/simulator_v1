@@ -9,7 +9,7 @@
 This repository accompanies our research paper titled "[Generative Agents: Interactive Simulacra of Human Behavior](https://arxiv.org/abs/2304.03442)." It contains our core simulation module for  generative agents—computational agents that simulate believable human behaviors—and their game environment. Below, we document the steps for setting up the simulation environment on your local machine and for replaying the simulation as a demo animation.
 
 ## <img src="https://joonsungpark.s3.amazonaws.com:443/static/assets/characters/profile/Isabella_Rodriguez.png" alt="Generative Isabella">   Setting Up the Environment 
-To set up your environment, you will need to generate a `utils.py` file that contains your OpenAI API key and download the necessary packages.
+To set up your environment, you will need to generate a `utils.py` file that contains your environment settings (and an API key if using OpenAI) and download the necessary packages.
 
 ### Step 1. Generate Utils File
 In the `reverie/backend_server` folder (where `reverie.py` is located), create a new file titled `utils.py` and copy and paste the content below into the file:
@@ -31,7 +31,7 @@ collision_block_id = "32125"
 # Verbose 
 debug = True
 ```
-Replace `<Your OpenAI API>` with your OpenAI API key, and `<name>` with your name.
+Replace `<Your OpenAI API>` with your OpenAI API key, and `<name>` with your name. For Ollama, the API key can be an empty string; see the Ollama setup below.
  
 ### Step 2. Install requirements.txt
 Install everything listed in the `requirements.txt` file (I strongly recommend first setting up a virtualenv as usual). A note on Python version: we tested our environment on Python 3.9.12. 
@@ -139,3 +139,93 @@ We encourage you to support the following three amazing artists who have designe
 In addition, we thank Lindsay Popowski, Philip Guo, Michael Terry, and the Center for Advanced Study in the Behavioral Sciences (CASBS) community for their insights, discussions, and support. Lastly, all locations featured in Smallville are inspired by real-world locations that Joon has frequented as an undergraduate and graduate student---he thanks everyone there for feeding and supporting him all these years.
 
 
+
+## GPT Sol setup
+
+Text generation now defaults to `gpt-5.6-sol` via the Responses API. Upgrade
+an existing virtual environment before restarting the backend:
+
+```bash
+python -m pip install 'openai>=1.68.2,<3' 'typing-extensions>=4.11,<5' 'h11>=0.16,<1'
+```
+
+Your existing `utils.py` API key still works. `OPENAI_API_KEY`, when set,
+overrides it. `OPENAI_MODEL` can override the text model (the adapter requires
+Responses API support and `reasoning.effort="none"`). Legacy prompt `engine`
+fields are ignored; all text calls use the configured model. Legacy stop
+sequences are applied locally, and sampling/penalty fields are not forwarded.
+Embeddings stay on `text-embedding-ada-002` to match stored agent memories.
+
+Restart `python reverie.py` from `reverie/backend_server`. After a failed run
+containing `TOKEN LIMIT EXCEEDED` schedules, start from
+`base_the_ville_isabella_maria_klaus` with a new simulation name. Open the
+simulator page once, then try `run 1`. API errors now propagate to the terminal
+instead of being inserted into the agents' schedules.
+
+Run offline adapter tests from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+
+## Ollama setup (local text and embeddings)
+
+Install [Ollama](https://ollama.com/download), then start it with `ollama serve`
+(or open the Ollama desktop app). In another terminal, download both models:
+
+```bash
+ollama pull llama3.1:8b
+ollama pull nomic-embed-text
+```
+
+With your Python environment activated, run these commands from the repository root:
+
+```bash
+export LLM_PROVIDER=ollama
+export OLLAMA_MODEL=llama3.1:8b
+export OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+cd reverie/backend_server
+python reverie.py
+```
+
+Keep the Django server and simulator browser page running as described above.
+Use `base_the_ville_isabella_maria_klaus`, choose a new simulation name, then
+try `run 1`. No OpenAI API key is needed in Ollama mode. The existing `openai`
+Python dependency talks to Ollama's [compatible API](https://docs.ollama.com/api/openai-compatibility);
+no additional Python package is needed.
+
+Optional settings:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Server address; `/v1` is appended if omitted. |
+| `OLLAMA_TIMEOUT` | `300` | Request timeout in seconds, allowing local model loading. |
+| `OLLAMA_API_KEY` | `ollama` | Optional authentication for a protected server. |
+| `OLLAMA_REASONING_EFFORT` | `none` for Qwen 3 models; server default otherwise | Control internal thinking: `none`, `low`, `medium`, `high`, `max`, or `default`. Model support varies. |
+
+Qwen 3 models (including `qwen3.6:27b`) request thinking disabled by default
+through Ollama's `reasoning_effort="none"` setting. This avoids spending a long
+time on internal reasoning for small prompts such as wake-up hours. Agent
+memory reflection still runs normally. Set `OLLAMA_REASONING_EFFORT=default`
+to use the server's default behavior instead. The backend prints each text
+request's model, reasoning setting, and elapsed time on completion or API error.
+Restart the backend to pick up adapter changes; an already running request is
+not changed.
+
+All text entry points use `OLLAMA_MODEL`; embeddings use `OLLAMA_EMBEDDING_MODEL`.
+Use an instruction-following text model and a separate embedding-capable model.
+Local models can take longer and may follow the simulation's strict output formats
+less reliably. Truncated output is retried with a bounded larger budget; request
+failures surface in the terminal.
+
+Existing memories are automatically re-embedded in memory when their saved provider
+or model differs. Older saves without metadata are treated as OpenAI Ada embeddings.
+This can make the first load slow. Saving the simulation persists the new vectors
+and `embedding_metadata.json`, so subsequent loads with the same model reuse them.
+The source simulation is unchanged when you fork it. Keep model names/tags stable
+for saved simulations; replacing a model's weights under the same tag is not detected.
+
+To return to OpenAI, set `LLM_PROVIDER=openai` and configure `OPENAI_API_KEY` as above.
+`OPENAI_EMBEDDING_MODEL` defaults to `text-embedding-ada-002`; switching back also
+rebuilds memory vectors as needed. Restart the backend after changing settings.

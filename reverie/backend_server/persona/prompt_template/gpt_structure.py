@@ -2,83 +2,156 @@
 Author: Joon Sung Park (joonspk@stanford.edu)
 
 File: gpt_structure.py
-Description: Wrapper functions for calling OpenAI APIs.
+Description: Shared text and embedding adapter for OpenAI and Ollama.
 """
 import json
 import random
+import os
 import openai
 import time 
 
 from utils import *
 
-openai.api_key = openai_api_key
+# Preserve utils.py credentials; an environment variable can override them.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+if LLM_PROVIDER not in ("openai", "ollama"):
+  raise ValueError("LLM_PROVIDER must be 'openai' or 'ollama'")
+TEXT_MODEL = (os.getenv("OLLAMA_MODEL", "llama3.1:8b") if LLM_PROVIDER == "ollama"
+              else os.getenv("OPENAI_MODEL", "gpt-5.6-sol"))
+EMBEDDING_MODEL = (os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+                   if LLM_PROVIDER == "ollama"
+                   else os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"))
+EMBEDDING_IDENTITY = {"provider": LLM_PROVIDER, "model": EMBEDDING_MODEL}
+_client = None
+
+
+def get_client():
+  global _client
+  if _client is None:
+    if LLM_PROVIDER == "ollama":
+      base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+      if not base_url.endswith("/v1"):
+        base_url += "/v1"
+      _client = openai.OpenAI(
+        base_url=base_url, api_key=os.getenv("OLLAMA_API_KEY") or "ollama",
+        timeout=float(os.getenv("OLLAMA_TIMEOUT", "300")), max_retries=2)
+    else:
+      _client = openai.OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY") or openai_api_key,
+        timeout=90.0, max_retries=2)
+  return _client
+
+
+class ModelResponseError(RuntimeError):
+  """The API returned no usable complete text."""
+
+
+def _request_text(prompt, max_tokens=2048, continuation=False, stop=None):
+  instructions = (
+    "Return only the requested output, without commentary or Markdown fences. "
+    "Follow the requested format exactly."
+  )
+  if continuation:
+    instructions += (
+      " Continue the supplied text from its final character. Return only the "
+      "missing continuation; do not repeat the prompt or its final prefix."
+    )
+  stops = [stop] if isinstance(stop, str) else (stop or [])
+  if "\n" in stops:
+    instructions += " Output only the completion of the final line, on one line. Do not generate subsequent lines."
+  if LLM_PROVIDER == "ollama":
+    return _request_ollama_text(prompt, instructions, max_tokens, stops)
+  # A legacy 5-50 token budget is too small for Responses. Retry only output
+  # truncation, with a bounded budget; API failures still propagate directly.
+  budget = max(1024, int(max_tokens))
+  for attempt in range(3):
+    response = get_client().responses.create(
+      model=TEXT_MODEL, input=prompt, instructions=instructions,
+      reasoning={"effort": "none"},
+      max_output_tokens=budget, store=False)
+    text = response.output_text or ""
+    positions = [text.find(token) for token in stops if token and token in text]
+    reason = getattr(response.incomplete_details, "reason", None) if response.status == "incomplete" else None
+    # If the requested stop was reached, the needed prefix is complete even
+    # when generation of unwanted subsequent lines exhausted the API budget.
+    if positions and (response.status == "completed" or reason == "max_output_tokens"):
+      text = text[:min(positions)]
+      if text.strip():
+        return text
+    if response.status == "completed":
+      if text.strip():
+        return text
+      raise ModelResponseError(f"{TEXT_MODEL} returned no text (empty or refused output).")
+    if reason == "max_output_tokens" and attempt < 2:
+      budget *= 2
+      continue
+    raise ModelResponseError(
+      f"{TEXT_MODEL} response {response.status}: "
+      f"{response.incomplete_details or response.error}")
+
+
+def _request_ollama_text(prompt, instructions, max_tokens, stops):
+  # Simulation reflection is an ordinary prompt; it does not require a
+  # separate thinking trace for every small classification/completion call.
+  effort = os.getenv("OLLAMA_REASONING_EFFORT")
+  if effort is None and TEXT_MODEL.lower().split("/")[-1].startswith("qwen3"):
+    effort = "none"
+  options = {}
+  if effort and effort != "default":
+    if effort not in ("none", "low", "medium", "high", "max"):
+      raise ValueError("OLLAMA_REASONING_EFFORT must be default, none, low, medium, high, or max")
+    options["reasoning_effort"] = effort
+  budget = max(1024, int(max_tokens))
+  for attempt in range(3):
+    print(f"[Ollama] {TEXT_MODEL}: requesting response "
+          f"(reasoning={effort or 'default'}, max_tokens={budget}, attempt={attempt + 1})", flush=True)
+    started = time.monotonic()
+    try:
+      response = get_client().chat.completions.create(
+        model=TEXT_MODEL,
+        messages=[{"role": "system", "content": instructions},
+                  {"role": "user", "content": prompt}],
+        max_tokens=budget, temperature=0, stream=False, **options)
+    except openai.OpenAIError:
+      print(f"[Ollama] Request failed after {time.monotonic() - started:.1f}s", flush=True)
+      raise
+    if not response.choices:
+      raise ModelResponseError(f"{TEXT_MODEL} returned no choices.")
+    choice = response.choices[0]
+    print(f"[Ollama] Response after {time.monotonic() - started:.1f}s "
+          f"(finish_reason={choice.finish_reason})", flush=True)
+    text = choice.message.content or ""
+    # Apply legacy stops locally so a leading newline cannot end generation.
+    positions = [text.find(token) for token in stops if token and token in text]
+    if positions and choice.finish_reason in ("stop", "length"):
+      prefix = text[:min(positions)]
+      if prefix.strip():
+        return prefix
+    if choice.finish_reason == "stop" and text.strip():
+      return text
+    if choice.finish_reason == "length" and attempt < 2:
+      budget *= 2
+      continue
+    raise ModelResponseError(
+      f"{TEXT_MODEL} returned empty or incomplete text "
+      f"(finish_reason={choice.finish_reason}).")
+
 
 def temp_sleep(seconds=0.1):
   time.sleep(seconds)
 
-def ChatGPT_single_request(prompt): 
+def ChatGPT_single_request(prompt):
   temp_sleep()
-
-  completion = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo", 
-    messages=[{"role": "user", "content": prompt}]
-  )
-  return completion["choices"][0]["message"]["content"]
+  return _request_text(prompt)
 
 
-# ============================================================================
-# #####################[SECTION 1: CHATGPT-3 STRUCTURE] ######################
-# ============================================================================
-
-def GPT4_request(prompt): 
-  """
-  Given a prompt and a dictionary of GPT parameters, make a request to OpenAI
-  server and returns the response. 
-  ARGS:
-    prompt: a str prompt
-    gpt_parameter: a python dictionary with the keys indicating the names of  
-                   the parameter and the values indicating the parameter 
-                   values.   
-  RETURNS: 
-    a str of GPT-3's response. 
-  """
-  temp_sleep()
-
-  try: 
-    completion = openai.ChatCompletion.create(
-    model="gpt-4", 
-    messages=[{"role": "user", "content": prompt}]
-    )
-    return completion["choices"][0]["message"]["content"]
-  
-  except: 
-    print ("ChatGPT ERROR")
-    return "ChatGPT ERROR"
+def GPT4_request(prompt):
+  """Compatibility name for callers; all text generation uses TEXT_MODEL."""
+  return ChatGPT_single_request(prompt)
 
 
-def ChatGPT_request(prompt): 
-  """
-  Given a prompt and a dictionary of GPT parameters, make a request to OpenAI
-  server and returns the response. 
-  ARGS:
-    prompt: a str prompt
-    gpt_parameter: a python dictionary with the keys indicating the names of  
-                   the parameter and the values indicating the parameter 
-                   values.   
-  RETURNS: 
-    a str of GPT-3's response. 
-  """
-  # temp_sleep()
-  try: 
-    completion = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo", 
-    messages=[{"role": "user", "content": prompt}]
-    )
-    return completion["choices"][0]["message"]["content"]
-  
-  except: 
-    print ("ChatGPT ERROR")
-    return "ChatGPT ERROR"
+def ChatGPT_request(prompt):
+  return ChatGPT_single_request(prompt)
 
 
 def GPT4_safe_generate_response(prompt, 
@@ -114,7 +187,9 @@ def GPT4_safe_generate_response(prompt,
         print (curr_gpt_response)
         print ("~~~~")
 
-    except: 
+    except (openai.OpenAIError, ModelResponseError):
+      raise
+    except (ValueError, TypeError, KeyError, IndexError):
       pass
 
   return False
@@ -158,7 +233,9 @@ def ChatGPT_safe_generate_response(prompt,
         print (curr_gpt_response)
         print ("~~~~")
 
-    except: 
+    except (openai.OpenAIError, ModelResponseError):
+      raise
+    except (ValueError, TypeError, KeyError, IndexError):
       pass
 
   return False
@@ -184,7 +261,9 @@ def ChatGPT_safe_generate_response_OLD(prompt,
         print (curr_gpt_response)
         print ("~~~~")
 
-    except: 
+    except (openai.OpenAIError, ModelResponseError):
+      raise
+    except (ValueError, TypeError, KeyError, IndexError):
       pass
   print ("FAIL SAFE TRIGGERED") 
   return fail_safe_response
@@ -194,34 +273,15 @@ def ChatGPT_safe_generate_response_OLD(prompt,
 # ###################[SECTION 2: ORIGINAL GPT-3 STRUCTURE] ###################
 # ============================================================================
 
-def GPT_request(prompt, gpt_parameter): 
-  """
-  Given a prompt and a dictionary of GPT parameters, make a request to OpenAI
-  server and returns the response. 
-  ARGS:
-    prompt: a str prompt
-    gpt_parameter: a python dictionary with the keys indicating the names of  
-                   the parameter and the values indicating the parameter 
-                   values.   
-  RETURNS: 
-    a str of GPT-3's response. 
+def GPT_request(prompt, gpt_parameter):
+  """Adapt legacy completion prompts to the configured text provider.
+
+  Legacy engine and sampling/penalty fields are intentionally not forwarded.
   """
   temp_sleep()
-  try: 
-    response = openai.Completion.create(
-                model=gpt_parameter["engine"],
-                prompt=prompt,
-                temperature=gpt_parameter["temperature"],
-                max_tokens=gpt_parameter["max_tokens"],
-                top_p=gpt_parameter["top_p"],
-                frequency_penalty=gpt_parameter["frequency_penalty"],
-                presence_penalty=gpt_parameter["presence_penalty"],
-                stream=gpt_parameter["stream"],
-                stop=gpt_parameter["stop"],)
-    return response.choices[0].text
-  except: 
-    print ("TOKEN LIMIT EXCEEDED")
-    return "TOKEN LIMIT EXCEEDED"
+  return _request_text(
+    prompt, max_tokens=gpt_parameter.get("max_tokens", 2048),
+    continuation=True, stop=gpt_parameter.get("stop"))
 
 
 def generate_prompt(curr_input, prompt_lib_file): 
@@ -264,8 +324,11 @@ def safe_generate_response(prompt,
 
   for i in range(repeat): 
     curr_gpt_response = GPT_request(prompt, gpt_parameter)
-    if func_validate(curr_gpt_response, prompt=prompt): 
-      return func_clean_up(curr_gpt_response, prompt=prompt)
+    try:
+      if func_validate(curr_gpt_response, prompt=prompt):
+        return func_clean_up(curr_gpt_response, prompt=prompt)
+    except (ValueError, TypeError, KeyError, IndexError):
+      pass  # Retry malformed model output, never API failures.
     if verbose: 
       print ("---- repeat count: ", i, curr_gpt_response)
       print (curr_gpt_response)
@@ -273,12 +336,23 @@ def safe_generate_response(prompt,
   return fail_safe_response
 
 
-def get_embedding(text, model="text-embedding-ada-002"):
+def get_embedding(text, model=None):
   text = text.replace("\n", " ")
   if not text: 
     text = "this is blank"
-  return openai.Embedding.create(
-          input=[text], model=model)['data'][0]['embedding']
+  return get_client().embeddings.create(
+          input=[text], model=model or EMBEDDING_MODEL,
+          encoding_format="float").data[0].embedding
+
+
+def prepare_memory_embeddings(embeddings, saved_identity):
+  """Rebuild vectors when changing models, even if dimensions happen to match."""
+  legacy_identity = {"provider": "openai", "model": "text-embedding-ada-002"}
+  if (saved_identity or legacy_identity) == EMBEDDING_IDENTITY:
+    return embeddings
+  if embeddings:
+    print(f"Rebuilding {len(embeddings)} memory embeddings with {EMBEDDING_MODEL}...")
+  return {text: get_embedding(text) for text in embeddings}
 
 
 if __name__ == '__main__':
@@ -309,8 +383,6 @@ if __name__ == '__main__':
                                  True)
 
   print (output)
-
-
 
 
 

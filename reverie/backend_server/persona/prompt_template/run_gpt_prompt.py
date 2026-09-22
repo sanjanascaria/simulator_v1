@@ -413,18 +413,14 @@ def run_gpt_prompt_task_decomp(persona,
 
     return cr
 
-  def __func_validate(gpt_response, prompt=""): 
-    # TODO -- this sometimes generates error 
-    try: 
-      __func_clean_up(gpt_response)
-    except: 
-      pass
-      # return False
-    return gpt_response
+  def __func_validate(gpt_response, prompt=""):
+    try:
+      return bool(__func_clean_up(gpt_response, prompt=prompt))
+    except (ValueError, TypeError, IndexError):
+      return False
 
-  def get_fail_safe(): 
-    fs = ["asleep"]
-    return fs
+  def get_fail_safe():
+    return [[task, duration]]
 
   gpt_param = {"engine": "text-davinci-003", "max_tokens": 1000, 
              "temperature": 0, "top_p": 1, "stream": False,
