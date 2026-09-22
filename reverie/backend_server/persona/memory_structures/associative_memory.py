@@ -12,6 +12,9 @@ sys.path.append('../../')
 
 import json
 import datetime
+from pathlib import Path
+
+from persona.prompt_template.gpt_structure import EMBEDDING_IDENTITY, prepare_memory_embeddings
 
 from global_methods import *
 
@@ -62,9 +65,13 @@ class AssociativeMemory:
     self.kw_strength_event = dict()
     self.kw_strength_thought = dict()
 
-    self.embeddings = json.load(open(f_saved + "/embeddings.json"))
+    self.embeddings = json.loads((Path(f_saved) / "embeddings.json").read_text())
+    metadata_path = Path(f_saved) / "embedding_metadata.json"
+    saved_identity = json.loads(metadata_path.read_text()) if metadata_path.exists() else None
+    self.embeddings = prepare_memory_embeddings(self.embeddings, saved_identity)
+    self.embedding_identity = dict(EMBEDDING_IDENTITY)
 
-    nodes_load = json.load(open(f_saved + "/nodes.json"))
+    nodes_load = json.loads((Path(f_saved) / "nodes.json").read_text())
     for count in range(len(nodes_load.keys())): 
       node_id = f"node_{str(count+1)}"
       node_details = nodes_load[node_id]
@@ -102,7 +109,7 @@ class AssociativeMemory:
         self.add_thought(created, expiration, s, p, o, 
                    description, keywords, poignancy, embedding_pair, filling)
 
-    kw_strength_load = json.load(open(f_saved + "/kw_strength.json"))
+    kw_strength_load = json.loads((Path(f_saved) / "kw_strength.json").read_text())
     if kw_strength_load["kw_strength_event"]: 
       self.kw_strength_event = kw_strength_load["kw_strength_event"]
     if kw_strength_load["kw_strength_thought"]: 
@@ -148,6 +155,8 @@ class AssociativeMemory:
 
     with open(out_json+"/embeddings.json", "w") as outfile:
       json.dump(self.embeddings, outfile)
+    with open(out_json+"/embedding_metadata.json", "w") as outfile:
+      json.dump(self.embedding_identity, outfile)
 
 
   def add_event(self, created, expiration, s, p, o, 
@@ -331,7 +340,6 @@ class AssociativeMemory:
       return self.kw_to_chat[target_persona_name.lower()][0]
     else: 
       return False
-
 
 
 
